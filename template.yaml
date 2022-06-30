@@ -29,7 +29,54 @@ Parameters:
     Type: String
     Default: "buildspec.yml"
 
+
+Globals: # https://docs.aws.amazon.com/serverless-application-model/latest/developerguide/sam-specification-template-anatomy-globals.html
+  Function:
+    Timeout: 10
+    MemorySize: 128
+    Tracing: Active # https://docs.aws.amazon.com/lambda/latest/dg/lambda-x-ray.html
+    Environment:
+      Variables:
+        # Powertools env vars: https://awslabs.github.io/aws-lambda-powertools-python/#environment-variables
+        LOG_LEVEL: INFO
+        POWERTOOLS_LOGGER_SAMPLE_RATE: 1 
+        POWERTOOLS_LOGGER_LOG_EVENT: true
+        POWERTOOLS_METRICS_NAMESPACE: !Ref ProjectName
+
+
 Resources: 
+  ### API
+
+  GetHlsUrlFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: get_url/
+      Handler: app.lambda_handler
+      Runtime: python3.9
+      Tags:
+        project: !Ref ProjectName
+      Policies:
+        - AmazonKinesisVideoStreamsFullAccess
+      Events:
+        GetApi:
+          Type: Api
+          Properties:
+            Path: /
+            Method: GET
+            RestApiId: !Ref ApiGatewayApi
+
+  ApiGatewayApi:
+    Type: AWS::Serverless::Api
+    Properties:
+      StageName: Prod
+      DefinitionBody:
+        Fn::Transform:
+          Name: "AWS::Include"
+          Parameters:
+            Location: "./openapi.yml"
+      Tags:
+        project: !Ref ProjectName
+
   ### STATIC HOSTING 
 
   # Bucket to host static web assets
@@ -224,6 +271,14 @@ Resources:
         EnvironmentVariables: # Inject env variables into codeBuild (accessible as ${Name} in the buildspec.yml)
           - Name: HOSTING_BUCKET
             Value: !Ref HostingBucket
+          - Name: IDENTITY_POOL_ID
+            Value: !Ref IdentityPool
+          - Name: AWS_REGION
+            Value: !Ref AWS::Region
+          - Name: USERPOOL_ID
+            Value: !Ref UserPool
+          - Name: USERPOOL_CLIENT_ID
+            Value: !Ref UserPoolClient
       Tags:
         - Key: project
           Value: !Ref ProjectName
@@ -270,6 +325,112 @@ Resources:
       TargetPipelineVersion: !GetAtt CodePipeline.Version
       RegisterWithThirdParty: true
 
+  ################## 
+  # Authentication #
+  ##################
+
+ # Cognito UserPool used for authenticting users and locking down AppSync API
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      AutoVerifiedAttributes:
+        - email
+      UserPoolName: !Sub ${ProjectName}-userPool
+      MfaConfiguration: "OFF"
+      EmailConfiguration:
+        EmailSendingAccount: COGNITO_DEFAULT
+      Schema:
+        - Name: email
+          AttributeDataType: String
+          Mutable: false
+          Required: true
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      ClientName: !Sub ${ProjectName}-userPoolClient
+      GenerateSecret: false
+      UserPoolId: !Ref UserPool
+
+  # Creates a federeated Identity pool
+  IdentityPool:
+    Type: AWS::Cognito::IdentityPool
+    Properties:
+      IdentityPoolName: !Sub ${ProjectName}-IdentityPool
+      AllowUnauthenticatedIdentities: false
+      CognitoIdentityProviders:
+        - ClientId: !Ref UserPoolClient
+          ProviderName: !GetAtt UserPool.ProviderName
+
+  # Create a role for unauthorized acces to AWS resources.
+  CognitoUnAuthorizedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Federated: "cognito-identity.amazonaws.com"
+            Action:
+              - "sts:AssumeRoleWithWebIdentity"
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": unauthenticated
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-CognitoUnAuth-Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "mobileanalytics:PutEvents"
+                  - "cognito-sync:*"
+                  - "cognito-identity:*"
+                Resource: "*"
+
+  # Create a role for authorized acces to AWS resources.
+  CognitoAuthorizedRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Effect: "Allow"
+            Principal:
+              Federated: "cognito-identity.amazonaws.com"
+            Action:
+              - "sts:AssumeRoleWithWebIdentity"
+            Condition:
+              StringEquals:
+                "cognito-identity.amazonaws.com:aud": !Ref IdentityPool
+              "ForAnyValue:StringLike":
+                "cognito-identity.amazonaws.com:amr": authenticated
+      Policies:
+        - PolicyName: !Sub ${ProjectName}-CognitoAuth-Policy
+          PolicyDocument:
+            Version: "2012-10-17"
+            Statement:
+              - Effect: "Allow"
+                Action:
+                  - "mobileanalytics:PutEvents"
+                  - "cognito-sync:*"
+                  - "cognito-identity:*"
+                Resource: "*"
+
+
+  # Assigns the roles to the Identity Pool
+  IdentityPoolRoleMapping:
+    Type: AWS::Cognito::IdentityPoolRoleAttachment
+    Properties:
+      IdentityPoolId: !Ref IdentityPool
+      Roles:
+        authenticated: !GetAtt CognitoAuthorizedRole.Arn
+        unauthenticated: !GetAtt CognitoUnAuthorizedRole.Arn  
+
+
 Outputs:
   CodePipelineArtifactStoreBucket:
     Description: Bucket used for storing codepieline artifacts
@@ -277,3 +438,11 @@ Outputs:
   Domain:
     Description: Cloudfront Domain
     Value: !GetAtt cloudfrontDistribution.DomainName
+  UserPoolId:
+    Value: !Ref UserPool
+  UserPoolARN:
+    Value: !GetAtt UserPool.Arn
+  UserPoolClientId:
+    Value: !Ref UserPoolClient
+  IdentityPoolId:
+    Value: !Ref IdentityPool
