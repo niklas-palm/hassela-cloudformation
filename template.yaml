@@ -219,7 +219,7 @@ Resources:
         Type: CODEPIPELINE
       Environment:
         ComputeType: BUILD_GENERAL1_SMALL # SMALL | MEDIUM | LARGE
-        Image: 'aws/codebuild/standard:3.0'
+        Image: 'aws/codebuild/standard:5.0'
         Type: LINUX_CONTAINER
         EnvironmentVariables: # Inject env variables into codeBuild (accessible as ${Name} in the buildspec.yml)
           - Name: HOSTING_BUCKET
